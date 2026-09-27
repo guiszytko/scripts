@@ -131,6 +131,12 @@ install_packages() {
     if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw bacula; then
         log_ok "Catálogo 'bacula' já existe no PostgreSQL, pulando criação."
     else
+    log_step "Sincronizando fuso horário do PostgreSQL com o sistema"
+    SYS_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+    sudo -u postgres psql -c "ALTER SYSTEM SET timezone TO '${SYS_TZ}';" >/dev/null 2>&1 || true
+    systemctl restart postgresql
+    sleep 1
+
     log_step "Ajustando autenticação do PostgreSQL (peer -> md5 para conexões locais)"
     PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | head -1)
     if [ -n "$PG_VERSION" ]; then
@@ -311,6 +317,14 @@ EOF
         log_warn "Confira manualmente se as senhas batem, senão o Director não autentica no Storage local."
     fi
 
+    log_step "Sincronizando a mesma senha nos Autochanger padrão (File1/File2) do bacula-dir.conf"
+    for AC_NAME in File1 File2; do
+        if grep -q "Name = ${AC_NAME}$" "$DIR_CONF"; then
+            sed -i "/Name = ${AC_NAME}$/,/^}/ s|Password = \"[^\"]*\"|Password = \"${STORAGE_PASSWORD}\"|" "$DIR_CONF"
+        fi
+    done
+    log_ok "Autochanger padrão sincronizados (evita erro no job BackupCatalog)."
+
     # guarda a senha de auth Director<->Storage num lugar fácil de reler depois
     echo "$STORAGE_PASSWORD" > /root/.bacula-sd-password
     chmod 600 /root/.bacula-sd-password
@@ -323,15 +337,17 @@ EOF
 # 4. Ativar OCI (Cloud storage - suportado nativamente no Bacula Community)
 # ======================================================================
 configure_oci() {
-    DIR_CONF="/etc/bacula/bacula-dir.conf"
-    SD_CONF="/etc/bacula/bacula-sd.conf"
-
-    if ! grep -q "Local-Backup-Storage" "$DIR_CONF" 2>/dev/null; then
+    if [ ! -f /etc/bacula/bacula-dir.conf ]; then
         log_err "Erro: rode a opção 1 (instalação base) primeiro."
         return 1
     fi
 
-    echo "-- OCI Object Storage --"
+    echo "-- Backup pra OCI Object Storage (via rclone) --"
+    echo "O Bacula grava só localmente; o rclone sincroniza os volumes pra"
+    echo "OCI de forma independente, agendado via cron. Isso evita o driver"
+    echo "de nuvem nativo do Bacula, que exige compilar libs3 e tem bugs"
+    echo "conhecidos de build nessa versão."
+    echo ""
     echo "Você precisa ter em mãos: namespace, região, nome do bucket já criado,"
     echo "e as Customer Secret Keys (Access Key + Secret Key) da OCI."
     read -rp "Tem tudo isso em mãos agora? (s/N): " OCI_READY
@@ -344,72 +360,88 @@ configure_oci() {
     read -rp "Região da OCI (ex: sa-vinhedo-1): " OCI_REGION
     read -rp "Nome do bucket na OCI: " OCI_BUCKET
     read -rp "Customer Secret Key ID: " OCI_ACCESS_KEY
-    read -rsp "Customer Secret Key: " OCI_SECRET_KEY
-    echo ""
+    read -rp "Customer Secret Key: " OCI_SECRET_KEY
+    if [ -z "$OCI_SECRET_KEY" ]; then
+        log_err "Secret Key veio vazia. Abortando pra não gravar config quebrada."
+        return 1
+    fi
+    log_ok "Secret Key recebida (${#OCI_SECRET_KEY} caracteres)."
+    read -rp "Nome da 'pasta' dentro do bucket pra guardar os backups [bacula-backup]: " OCI_FOLDER
+    OCI_FOLDER=${OCI_FOLDER:-bacula-backup}
+    read -rp "Horário pra rodar a sincronização diária [01:00]: " SYNC_TIME
+    SYNC_TIME=${SYNC_TIME:-01:00}
+    SYNC_HOUR=$(echo "$SYNC_TIME" | cut -d: -f1)
+    SYNC_MIN=$(echo "$SYNC_TIME" | cut -d: -f2)
 
-    STORAGE_PASSWORD=$(cat /root/.bacula-sd-password 2>/dev/null || openssl rand -base64 24)
+    log_step "Instalando rclone"
+    command -v rclone >/dev/null 2>&1 || apt-get install -y rclone
 
-    log_step "Adicionando Cloud Device no Storage Daemon"
-    cat >> "$SD_CONF" <<EOF
+    OCI_ENDPOINT="https://${OCI_NAMESPACE}.compat.objectstorage.${OCI_REGION}.oci.customer-oci.com"
 
-Cloud {
-  Name = OCI-Cloud
-  Driver = "S3"
-  HostName = "${OCI_NAMESPACE}.compat.objectstorage.${OCI_REGION}.oraclecloud.com"
-  BucketName = "${OCI_BUCKET}"
-  AccessKey = "${OCI_ACCESS_KEY}"
-  SecretKey = "${OCI_SECRET_KEY}"
-  Protocol = HTTPS
-  UriStyle = Path
-  Upload = EachPart
-}
-
-Device {
-  Name = OCI-Cloud-Device
-  Device Type = Cloud
-  Cloud = OCI-Cloud
-  Media Type = Cloud
-  Archive Device = /var/lib/bacula/cloud-cache
-  LabelMedia = yes
-  Maximum Concurrent Jobs = 5
-}
-EOF
-
-    log_step "Adicionando Storage e Pool da OCI no Director"
-    cat >> "$DIR_CONF" <<EOF
-
-Storage {
-  Name = OCI-Cloud-Storage
-  Address = 127.0.0.1
-  Password = "${STORAGE_PASSWORD}"
-  Device = OCI-Cloud-Device
-  Media Type = Cloud
-  TLS Enable = no
-  TLS PSK Enable = no
-}
-
-Pool {
-  Name = OCI-Pool
-  Pool Type = Backup
-  Storage = OCI-Cloud-Storage
-  Next Pool = OCI-Pool
-  Volume Retention = 180 days
-  Label Format = "OCI-\${Year}\${Month:p/2/0/r}\${Day:p/2/0/r}-\${NumVols}"
-  Recycle = yes
-}
-EOF
-
-    log_step "Ligando o Local-Pool à OCI (Next Pool, pra copy job)"
-    if ! grep -A5 "^Pool {" "$DIR_CONF" | grep -q "Name = Local-Pool"; then
-        log_warn "Não achei o Local-Pool automaticamente; adicione 'Next Pool = OCI-Pool' nele manualmente."
+    log_step "Configurando o remote 'oci-backup' no rclone"
+    mkdir -p /root/.config/rclone
+    if rclone listremotes 2>/dev/null | grep -q "^oci-backup:"; then
+        rclone config update oci-backup \
+            access_key_id="$OCI_ACCESS_KEY" \
+            secret_access_key="$OCI_SECRET_KEY" \
+            endpoint="$OCI_ENDPOINT" \
+            region="$OCI_REGION" \
+            force_path_style=true
     else
-        sed -i "/Name = Local-Pool/,/^}/ { /Storage = Local-Backup-Storage/a\\  Next Pool = OCI-Pool
-        }" "$DIR_CONF"
+        rclone config create oci-backup s3 \
+            provider=Other \
+            access_key_id="$OCI_ACCESS_KEY" \
+            secret_access_key="$OCI_SECRET_KEY" \
+            endpoint="$OCI_ENDPOINT" \
+            region="$OCI_REGION" \
+            force_path_style=true
     fi
 
-    log_ok "OCI configurada. Crie um job de Copy manualmente (Type = Copy, Pool = Local-Pool,"
-    echo "Selection Type = PoolUncopiedJobs) se quiser cópia automática pra nuvem, igual fizemos no Bareos."
+    log_step "Testando a conexão com o bucket"
+    if rclone ls "oci-backup:${OCI_BUCKET}" >/dev/null 2>&1; then
+        log_ok "Conexão com o bucket '${OCI_BUCKET}' funcionando."
+    else
+        log_err "Não consegui acessar o bucket. Confira namespace/região/bucket/chaves."
+        log_err "Teste manual: rclone ls oci-backup:${OCI_BUCKET}"
+        return 1
+    fi
+
+    log_step "Criando o agendamento (cron) da sincronização diária"
+    # --s3-chunk-size 256M: com o limite de 10.000 partes do S3/OCI, um chunk
+    #   de 64M só cobre arquivos até ~640GB - insuficiente pra volumes grandes
+    #   (ex: 1TB+). 256M cobre com folga até ~2.5TB por arquivo.
+    # flock: evita uma segunda execução começar antes da anterior terminar
+    #   (sincronizações grandes podem legitimamente levar mais de 1 dia).
+    cat > /etc/cron.d/rclone-backup-oci <<EOF
+# Sincroniza os volumes locais do Bacula com a OCI, todo dia.
+# Gerado por bacula-manager.sh
+${SYNC_MIN} ${SYNC_HOUR} * * * root /usr/bin/flock -n /var/run/rclone-backup.lock /usr/bin/rclone sync ${MOUNT_POINT}/bacula-volumes oci-backup:${OCI_BUCKET}/${OCI_FOLDER}/ --s3-chunk-size 256M --s3-upload-concurrency 8 --transfers 4 --log-file=/var/log/rclone-backup.log --log-level INFO
+EOF
+    chmod 644 /etc/cron.d/rclone-backup-oci
+    touch /var/log/rclone-backup.log
+
+    # Remove blocos antigos do driver de nuvem nativo do Bacula, se existirem
+    # de uma tentativa anterior (não funcionam sem libs3 compilado)
+    if grep -q "OCI-Cloud-Storage\|OCI-Cloud-Device" /etc/bacula/bacula-dir.conf /etc/bacula/bacula-sd.conf 2>/dev/null; then
+        log_warn "Encontrei configuração antiga do driver de nuvem nativo do Bacula"
+        log_warn "(que não funciona sem compilar libs3). Ela fica inofensiva parada"
+        log_warn "no arquivo, mas se quiser remover, use a opção 13 (Reparar config)"
+        log_warn "ou peça ajuda pra gerar o comando de limpeza."
+    fi
+
+    log_ok "Backup pra OCI configurado via rclone."
+    echo ""
+    echo "Sincroniza todo dia às ${SYNC_TIME} (via cron)."
+    echo "Pasta no bucket: ${OCI_FOLDER}/"
+    echo ""
+    echo "Pra rodar manualmente agora (primeira vez manda tudo, é normal):"
+    echo "  sudo flock -n /var/run/rclone-backup.lock rclone sync ${MOUNT_POINT}/bacula-volumes oci-backup:${OCI_BUCKET}/${OCI_FOLDER}/ --s3-chunk-size 256M --s3-upload-concurrency 8 --transfers 4 --progress"
+    echo ""
+    echo "Pra ver o log da última sincronização:"
+    echo "  sudo tail -f /var/log/rclone-backup.log"
 }
+
+
 
 # ======================================================================
 # 5. Serviços
@@ -551,6 +583,49 @@ full_purge() {
 
     log_ok "Tudo removido. O disco ${MOUNT_POINT} e o /etc/fstab NÃO foram mexidos."
     echo "Pra reinstalar do zero, rode a opção 1."
+}
+
+setup_disk_alert() {
+    log_step "Configurando alerta de espaço em disco"
+
+    read -rp "Alertar quando o disco raiz (/) passar de quantos % de uso? [85]: " THRESHOLD
+    THRESHOLD=${THRESHOLD:-85}
+
+    cat > /usr/local/bin/check-disk-space.sh <<EOF
+#!/bin/bash
+# Gerado por bacula-manager.sh - alerta de espaço em disco
+THRESHOLD=${THRESHOLD}
+
+for MOUNT in / ${MOUNT_POINT}; do
+    USED=\$(df --output=pcent "\$MOUNT" 2>/dev/null | tail -1 | tr -d ' %')
+    if [ -n "\$USED" ] && [ "\$USED" -ge "\$THRESHOLD" ]; then
+        logger -t disk-space-alert -p user.warning "ALERTA: \$MOUNT está com \${USED}% de uso (limite: \${THRESHOLD}%)"
+    fi
+done
+EOF
+    chmod +x /usr/local/bin/check-disk-space.sh
+
+    cat > /etc/cron.d/disk-space-alert <<'EOF'
+# Checa espaço em disco a cada 2 horas, gera alerta no syslog se passar do limite
+0 */2 * * * root /usr/local/bin/check-disk-space.sh
+EOF
+    chmod 644 /etc/cron.d/disk-space-alert
+
+    log_step "Configurando aviso na tela de login (SSH)"
+    cat > /etc/update-motd.d/95-disk-space <<EOF
+#!/bin/bash
+THRESHOLD=${THRESHOLD}
+for MOUNT in / ${MOUNT_POINT}; do
+    USED=\$(df --output=pcent "\$MOUNT" 2>/dev/null | tail -1 | tr -d ' %')
+    if [ -n "\$USED" ] && [ "\$USED" -ge "\$THRESHOLD" ]; then
+        echo -e "\033[1;31m⚠ AVISO: \$MOUNT está com \${USED}% de uso de disco (limite: \${THRESHOLD}%)\033[0m"
+    fi
+done
+EOF
+    chmod +x /etc/update-motd.d/95-disk-space
+
+    log_ok "Alerta configurado: checa a cada 2h (syslog) e mostra aviso ao logar via SSH se passar de ${THRESHOLD}%."
+    echo "Pra ver alertas já registrados: sudo journalctl -t disk-space-alert"
 }
 
 harden_server() {
@@ -862,6 +937,73 @@ EOF
 # ======================================================================
 # ======================================================================
 # ======================================================================
+delete_job() {
+    DIR_CONF="/etc/bacula/bacula-dir.conf"
+    echo "-- Jobs cadastrados --"
+    JOBS=$(awk '
+      /^Job[[:space:]]*{/ { in_job=1; name=""; next }
+      in_job && /Name[[:space:]]*=/ && name=="" { line=$0; sub(/^.*=[[:space:]]*/,"",line); gsub(/"/,"",line); name=line }
+      /^}/ { if (in_job && name!="") print name; in_job=0; name="" }
+    ' "$DIR_CONF")
+
+    if [ -z "$JOBS" ]; then
+        log_warn "Nenhum job cadastrado."
+        return
+    fi
+
+    i=1
+    declare -A JOB_MAP
+    while IFS= read -r JNAME; do
+        echo " ${i}) ${JNAME}"
+        JOB_MAP[$i]="$JNAME"
+        i=$((i+1))
+    done <<< "$JOBS"
+
+    echo ""
+    read -rp "Qual número excluir (ENTER pra cancelar): " CHOICE
+    [ -z "$CHOICE" ] && { log_warn "Cancelado."; return 0; }
+
+    TARGET="${JOB_MAP[$CHOICE]:-}"
+    if [ -z "$TARGET" ]; then
+        log_err "Número inválido."
+        return 1
+    fi
+
+    read -rp "Confirma excluir o job '${TARGET}'? (s/N): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[sS]$ ]]; then
+        log_warn "Cancelado, nada foi removido."
+        return 0
+    fi
+
+    TMP=$(mktemp)
+    awk -v target="$TARGET" '
+      /^Job[[:space:]]*{/ { in_job=1; name=""; buf=$0"\n"; next }
+      {
+        if (in_job) {
+          buf = buf $0 "\n"
+          if ($0 ~ /Name[[:space:]]*=/ && name=="") { line=$0; sub(/^.*=[[:space:]]*/,"",line); gsub(/"/,"",line); name=line }
+          if ($0 ~ /^}/) {
+            if (name != target) { printf "%s", buf }
+            in_job=0; buf=""; name=""
+            next
+          }
+          next
+        }
+        print
+      }
+    ' "$DIR_CONF" > "$TMP"
+    safe_overwrite "$TMP" "$DIR_CONF"
+
+    if bacula-dir -t -c "$DIR_CONF"; then
+        systemctl restart bacula-director
+        log_ok "Job '${TARGET}' removido. (O FileSet/Pool/Schedule dele ficaram no arquivo,"
+        echo "inofensivos, caso queira reaproveitar - remova manualmente se quiser limpar tudo.)"
+    else
+        log_err "A remoção quebrou a config. Restaurando backup automático não disponível -"
+        log_err "confira /etc/bacula/bacula-dir.conf manualmente."
+    fi
+}
+
 create_job() {
     DIR_CONF="/etc/bacula/bacula-dir.conf"
     echo "===================================================="
@@ -963,9 +1105,8 @@ EOF
     read -rp "Comando a rodar ANTES do backup, no client (ENTER pra pular): " PRE_CMD
     read -rp "Comando a rodar DEPOIS do backup, no client (ENTER pra pular): " POST_CMD
 
-    if [ "$RETENTION" != "45" ]; then
-        POOL_NAME="${JOB_NAME}-Pool"
-        cat >> "$DIR_CONF" <<EOF
+    POOL_NAME="${JOB_NAME}-Pool"
+    cat >> "$DIR_CONF" <<EOF
 
 Pool {
   Name = ${POOL_NAME}
@@ -976,9 +1117,6 @@ Pool {
   Recycle = yes
 }
 EOF
-    else
-        POOL_NAME="Local-Pool"
-    fi
 
     {
         echo ""
@@ -1146,8 +1284,10 @@ while true; do
     echo -e " ${GREEN}12)${RESET} Ativar firewall (UFW) e ajustar permissões"
     echo -e " ${GREEN}13)${RESET} Reparar config (remover recursos duplicados)"
     echo -e " ${GREEN}14)${RESET} Instalar Bacularis (WebUI)"
-    echo -e " ${RED}15)${RESET} Desinstalar tudo (Bacula + Bacularis + banco)"
-    echo -e " ${GREEN}16)${RESET} Sair"
+    echo -e " ${GREEN}15)${RESET} Excluir um job (lista e escolhe pelo número)"
+    echo -e " ${GREEN}16)${RESET} Configurar alerta de espaço em disco"
+    echo -e " ${RED}17)${RESET} Desinstalar tudo (Bacula + Bacularis + banco)"
+    echo -e " ${GREEN}18)${RESET} Sair"
     echo -e "${BOLD}${CYAN}====================================================${RESET}"
     read -rp "Escolha uma opção: " OPT
     case "$OPT" in
@@ -1165,8 +1305,10 @@ while true; do
         12) harden_server ;;
         13) repair_config ;;
         14) install_bacularis ;;
-        15) full_purge ;;
-        16) echo -e "${CYAN}Até mais.${RESET}"; exit 0 ;;
+        15) delete_job ;;
+        16) setup_disk_alert ;;
+        17) full_purge ;;
+        18) echo -e "${CYAN}Até mais.${RESET}"; exit 0 ;;
         *) log_err "Opção inválida." ;;
     esac
     pause
