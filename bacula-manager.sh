@@ -103,7 +103,7 @@ install_packages() {
     log_step "Instalando dependências de compilação"
     apt-get update -qq
     apt-get install -y build-essential libpq-dev libssl-dev python3-dev postgresql \
-        postgresql-contrib wget mc
+        postgresql-contrib wget mc rsync
 
     log_step "Baixando o código-fonte do Bacula 15.0.3"
     cd /usr/local/src || return 1
@@ -131,14 +131,36 @@ install_packages() {
     if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw bacula; then
         log_ok "Catálogo 'bacula' já existe no PostgreSQL, pulando criação."
     else
+    log_step "Movendo o catálogo do PostgreSQL pro disco grande (evita disco raiz cheio)"
+    PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | head -1)
+    if [ -n "$PG_VERSION" ]; then
+        NEW_DATADIR="${MOUNT_POINT}/postgresql-data"
+        CURRENT_DATADIR=$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null | tr -d ' ')
+        if [ "$CURRENT_DATADIR" != "$NEW_DATADIR" ]; then
+            systemctl stop postgresql
+            mkdir -p "$NEW_DATADIR"
+            rsync -a "/var/lib/postgresql/${PG_VERSION}/main/" "$NEW_DATADIR/"
+            chown -R postgres:postgres "$NEW_DATADIR"
+            chmod 700 "$NEW_DATADIR"
+            sed -i "s|^data_directory = .*|data_directory = '${NEW_DATADIR}'|" \
+                "/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
+            systemctl start postgresql
+            sleep 2
+            rm -rf "/var/lib/postgresql/${PG_VERSION}/main"
+            log_ok "Catálogo movido para ${NEW_DATADIR}."
+        else
+            log_ok "Catálogo já está no disco grande, pulando."
+        fi
+    fi
+
     log_step "Sincronizando fuso horário do PostgreSQL com o sistema"
     SYS_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
     sudo -u postgres psql -c "ALTER SYSTEM SET timezone TO '${SYS_TZ}';" >/dev/null 2>&1 || true
+    sudo -u postgres psql -c "ALTER SYSTEM SET log_timezone TO '${SYS_TZ}';" >/dev/null 2>&1 || true
     systemctl restart postgresql
     sleep 1
 
     log_step "Ajustando autenticação do PostgreSQL (peer -> md5 para conexões locais)"
-    PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | head -1)
     if [ -n "$PG_VERSION" ]; then
         PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
         if [ -f "$PG_HBA" ]; then
@@ -324,6 +346,20 @@ EOF
         fi
     done
     log_ok "Autochanger padrão sincronizados (evita erro no job BackupCatalog)."
+
+    log_step "Corrigindo o DefaultJob (padrão de fábrica gravava no /tmp)"
+    if grep -q 'Name = "DefaultJob"' "$DIR_CONF"; then
+        sed -i '/Name = "DefaultJob"/,/^}/ s/Storage = File1/Storage = Local-Backup-Storage/' "$DIR_CONF"
+        sed -i '/Name = "DefaultJob"/,/^}/ s/Pool = File$/Pool = Local-Pool/' "$DIR_CONF"
+        log_ok "DefaultJob agora grava no disco grande em vez do /tmp."
+    fi
+
+    log_step "Desativando o BackupClient1 (job de exemplo, só faz backup de /usr/sbin)"
+    if grep -q 'Name = "BackupClient1"' "$DIR_CONF" && \
+       ! sed -n '/Name = "BackupClient1"/,/^}/p' "$DIR_CONF" | grep -q "Enabled = no"; then
+        sed -i '/Name = "BackupClient1"/,/^}/ s/JobDefs = "DefaultJob"/JobDefs = "DefaultJob"\n  Enabled = no/' "$DIR_CONF"
+        log_ok "BackupClient1 desativado (remova 'Enabled = no' manualmente se quiser reativar)."
+    fi
 
     # guarda a senha de auth Director<->Storage num lugar fácil de reler depois
     echo "$STORAGE_PASSWORD" > /root/.bacula-sd-password
