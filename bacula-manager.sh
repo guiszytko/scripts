@@ -46,6 +46,51 @@ safe_overwrite() {
     chmod "$perm" "$dest" 2>/dev/null || true
 }
 
+backup_dir_conf() {
+    # uso: BAK=$(backup_dir_conf)  -> copia o bacula-dir.conf com data/hora
+    # e devolve o caminho da cópia (pra restaurar se a edição quebrar a config)
+    local bak="/etc/bacula/bacula-dir.conf.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -p /etc/bacula/bacula-dir.conf "$bak"
+    # mantém só as 10 cópias mais recentes
+    ls -1t /etc/bacula/bacula-dir.conf.bak-* 2>/dev/null | tail -n +11 | xargs -r rm -f
+    echo "$bak"
+}
+
+reload_director() {
+    # Valida a config e recarrega A QUENTE (bconsole 'reload'), sem derrubar
+    # jobs em andamento. Só cai pro restart se o bconsole não responder
+    # (Director parado) - e nunca recarrega uma config inválida.
+    local conf=/etc/bacula/bacula-dir.conf
+    if ! bacula-dir -t -c "$conf" >/dev/null 2>&1; then
+        log_err "Configuração INVÁLIDA - não recarreguei nada. Detalhe:"
+        bacula-dir -t -c "$conf" 2>&1 | grep -v "Orphaned buffer\|Safe_unlink" | tail -8
+        return 1
+    fi
+    if systemctl is-active --quiet bacula-director && echo "reload" | bconsole >/dev/null 2>&1; then
+        log_ok "Configuração recarregada a quente (jobs em andamento preservados)."
+    else
+        log_warn "Director não respondeu ao reload; iniciando/reiniciando o serviço."
+        systemctl restart bacula-director
+    fi
+    return 0
+}
+
+apply_dir_conf() {
+    # uso: apply_dir_conf <arquivo_temp>
+    # faz backup, grava o novo bacula-dir.conf (preservando dono/permissão),
+    # valida e recarrega a quente. Se a config ficar inválida, restaura o
+    # backup automaticamente. Retorna 0 só se tudo deu certo.
+    local tmp="$1" bak
+    bak=$(backup_dir_conf)
+    safe_overwrite "$tmp" /etc/bacula/bacula-dir.conf
+    if reload_director; then
+        return 0
+    fi
+    cp -p "$bak" /etc/bacula/bacula-dir.conf
+    log_err "A alteração deixou a config inválida - restaurei a versão anterior ($bak)."
+    return 1
+}
+
 # --------------------------------------------------------------------
 # Banner (personalize o texto abaixo se quiser trocar)
 # --------------------------------------------------------------------
@@ -765,48 +810,132 @@ change_client_ip() {
         print
       }
     ' "$DIR_CONF" > "$TMP"
-    safe_overwrite "$TMP" "$DIR_CONF"
+    apply_dir_conf "$TMP" && log_ok "IP do client ${CLI} atualizado para ${NEWIP}."
+}
 
-    bacula-dir -t -c "$DIR_CONF"
-    systemctl restart bacula-director
-    log_ok "IP do client ${CLI} atualizado para ${NEWIP}."
+# Lê/edita os "File = ..." do bloco Include de um FileSet, contando chaves
+# pra não confundir com Options {} nem Exclude {}.
+#   mode=names                -> lista os nomes dos FileSets
+#   mode=list                 -> "N<TAB>caminho" de cada File do Include
+#   mode=add     newpath=P    -> insere File = "P" ao fim do Include
+#   mode=remove  idx=N        -> apaga o N-ésimo File
+#   mode=replace idx=N newpath=P -> troca o N-ésimo File
+# (list/names imprimem o resultado; add/remove/replace imprimem o arquivo todo)
+fileset_awk() {
+    local mode="$1" target="$2" idx="${3:-0}" newpath="${4:-}"
+    awk -v mode="$mode" -v target="$target" -v idx="$idx" -v newpath="$newpath" '
+    BEGIN { in_fs=0; depth=0; inc=0; n=0; done=0 }
+    {
+        line=$0; skip=0; out=$0
+        if (!in_fs) {
+            if (line ~ /^FileSet[[:space:]]*\{/) { in_fs=1; depth=1; name=""; inc=0; n=0 }
+            if (mode!="names" && mode!="list") print out
+            next
+        }
+        is_comment = (line ~ /^[[:space:]]*#/)
+        tmp=line; o=gsub(/\{/,"{",tmp); c=gsub(/\}/,"}",tmp)
+        if (is_comment) { o=0; c=0 }
+        newdepth = depth + o - c
+
+        if (!is_comment && name=="" && depth==1 && line ~ /Name[[:space:]]*=/) {
+            nm=line; sub(/^.*=[[:space:]]*/,"",nm); gsub(/"/,"",nm); name=nm
+            if (mode=="names") print name
+        }
+        if (name==target) {
+            if (!is_comment && inc>0 && depth==inc && line ~ /^[[:space:]]*File[[:space:]]*=/) {
+                n++
+                p=line; sub(/^[[:space:]]*File[[:space:]]*=[[:space:]]*/,"",p); gsub(/"/,"",p)
+                if (mode=="list") print n "\t" p
+                if (mode=="remove" && n==idx) skip=1
+                if (mode=="replace" && n==idx) out="    File = \"" newpath "\""
+            }
+            if (mode=="add" && !done && inc>0 && newdepth<inc) {
+                print "    File = \"" newpath "\""
+                done=1
+            }
+        }
+        if (!is_comment && line ~ /^[[:space:]]*Include[[:space:]]*\{/) inc=newdepth
+        if (inc>0 && newdepth<inc) inc=0
+        depth=newdepth
+        if (depth<=0) { in_fs=0; name="" }
+        if (mode!="names" && mode!="list" && !skip) print out
+    }
+    ' /etc/bacula/bacula-dir.conf
 }
 
 edit_fileset() {
     DIR_CONF="/etc/bacula/bacula-dir.conf"
     echo "-- FileSets existentes --"
-    awk '/^FileSet[[:space:]]*{/{f=1} f && /Name[[:space:]]*=/{line=$0; sub(/^.*=[[:space:]]*/,"",line); gsub(/"/,"",line); print line; f=0}' "$DIR_CONF"
+    fileset_awk names "" | sed 's/^/  /'
     echo ""
     read -rp "Nome do FileSet a editar: " FSNAME
-    read -rp "Caminho a adicionar (ex: E:/ ou /mnt/win-x): " NEWPATH
-    [ -n "$NEWPATH" ] || { log_err "Vazio, abortando."; return 1; }
+    if ! fileset_awk names "" | grep -Fxq "$FSNAME"; then
+        log_err "FileSet '${FSNAME}' não existe."
+        return 1
+    fi
+
+    show_paths() {
+        echo ""
+        echo "-- Caminhos atuais em '${FSNAME}' --"
+        local out; out=$(fileset_awk list "$FSNAME")
+        if [ -z "$out" ]; then echo "  (nenhum)"; else echo "$out" | awk -F'\t' '{printf "  %s) %s\n",$1,$2}'; fi
+        echo ""
+    }
+    show_paths
+    COUNT=$(fileset_awk list "$FSNAME" | wc -l)
+
+    echo "O que deseja fazer?"
+    echo "  1) Adicionar um caminho"
+    echo "  2) Remover um caminho"
+    echo "  3) Substituir um caminho por outro"
+    echo "  4) Cancelar"
+    read -rp "Opção: " FSOP
+
+    NEWPATH=""; IDX=0
+    case "$FSOP" in
+        1) MODE=add
+           read -rp "Caminho a adicionar (ex: F:/CRIT): " NEWPATH ;;
+        2) MODE=remove
+           if [ "$COUNT" -le 1 ]; then
+               log_err "Esse FileSet só tem 1 caminho; removê-lo deixaria o FileSet vazio (config inválida)."
+               log_err "Use a opção 3 (Substituir) ou adicione o novo caminho antes de remover o antigo."
+               return 1
+           fi
+           read -rp "Número do caminho a remover: " IDX ;;
+        3) MODE=replace
+           read -rp "Número do caminho a substituir: " IDX
+           read -rp "Novo caminho (ex: F:/CRIT): " NEWPATH ;;
+        *) log_warn "Cancelado, nada foi alterado."; return 0 ;;
+    esac
+
+    if [ "$MODE" != "add" ]; then
+        if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "$COUNT" ]; then
+            log_err "Número inválido (escolha de 1 a ${COUNT})."
+            return 1
+        fi
+    fi
+    if [ "$MODE" != "remove" ]; then
+        NEWPATH=${NEWPATH//\\//}          # F:\CRIT -> F:/CRIT
+        NEWPATH=${NEWPATH//\"/}           # tira aspas digitadas sem querer
+        NEWPATH=$(echo "$NEWPATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$NEWPATH" ] || { log_err "Caminho vazio, abortando."; return 1; }
+    fi
 
     TMP=$(mktemp)
-    awk -v target="$FSNAME" -v newpath="$NEWPATH" '
-      /^FileSet[[:space:]]*{/ { in_fs=1; namebuf=""; block=$0 "\n"; inserted=0; next }
-      {
-        if (in_fs) {
-          if ($0 ~ /Name[[:space:]]*=/ && namebuf=="") { line=$0; sub(/^.*=[[:space:]]*/,"",line); gsub(/"/,"",line); namebuf=line }
-          if (namebuf==target && !inserted && $0 ~ /^  }/) {
-            block = block "    File = \"" newpath "\"\n"
-            inserted=1
-          }
-          block = block $0 "\n"
-          if ($0 ~ /^}/) {
-            printf "%s", block
-            in_fs=0; block=""; namebuf=""; inserted=0
-            next
-          }
-          next
-        }
-        print
-      }
-    ' "$DIR_CONF" > "$TMP"
-    safe_overwrite "$TMP" "$DIR_CONF"
+    fileset_awk "$MODE" "$FSNAME" "$IDX" "$NEWPATH" > "$TMP"
 
-    bacula-dir -t -c "$DIR_CONF"
-    systemctl restart bacula-director
-    log_ok "Caminho '${NEWPATH}' adicionado ao FileSet ${FSNAME}."
+    if apply_dir_conf "$TMP"; then
+        log_ok "FileSet '${FSNAME}' atualizado."
+        show_paths
+        log_warn "Importante: o Bacula detecta que o FileSet mudou e o PRÓXIMO backup"
+        log_warn "desse job vira Full automaticamente (depois volta ao ciclo normal)."
+        if [ "$MODE" != "add" ]; then
+            log_warn "O que saiu do FileSet deixa de ser salvo por este job. Se a ideia é"
+            log_warn "dividir uma pasta grande, garanta que cada parte esteja coberta por algum job."
+        fi
+    else
+        return 1
+    fi
 }
 
 edit_prejob_command() {
@@ -843,11 +972,7 @@ edit_prejob_command() {
         print
       }
     ' "$DIR_CONF" > "$TMP"
-    safe_overwrite "$TMP" "$DIR_CONF"
-
-    bacula-dir -t -c "$DIR_CONF"
-    systemctl restart bacula-director
-    log_ok "Comando pré-backup do job ${JOBNAME} atualizado."
+    apply_dir_conf "$TMP" && log_ok "Comando pré-backup do job ${JOBNAME} atualizado."
 }
 
 install_bacularis() {
@@ -1028,20 +1153,15 @@ delete_job() {
         print
       }
     ' "$DIR_CONF" > "$TMP"
-    safe_overwrite "$TMP" "$DIR_CONF"
-
-    if bacula-dir -t -c "$DIR_CONF"; then
-        systemctl restart bacula-director
+    if apply_dir_conf "$TMP"; then
         log_ok "Job '${TARGET}' removido. (O FileSet/Pool/Schedule dele ficaram no arquivo,"
         echo "inofensivos, caso queira reaproveitar - remova manualmente se quiser limpar tudo.)"
-    else
-        log_err "A remoção quebrou a config. Restaurando backup automático não disponível -"
-        log_err "confira /etc/bacula/bacula-dir.conf manualmente."
     fi
 }
 
 create_job() {
     DIR_CONF="/etc/bacula/bacula-dir.conf"
+    CJ_BAK=""
     echo "===================================================="
     echo " Criar novo job de backup"
     echo "===================================================="
@@ -1058,6 +1178,7 @@ create_job() {
         read -rsp "Senha do client (ENTER pra gerar automática): " C_PASS
         echo ""
         [ -z "$C_PASS" ] && C_PASS=$(openssl rand -base64 24)
+        [ -n "$CJ_BAK" ] || CJ_BAK=$(backup_dir_conf)
         cat >> "$DIR_CONF" <<EOF
 
 Client {
@@ -1142,6 +1263,7 @@ EOF
     read -rp "Comando a rodar DEPOIS do backup, no client (ENTER pra pular): " POST_CMD
 
     POOL_NAME="${JOB_NAME}-Pool"
+    [ -n "$CJ_BAK" ] || CJ_BAK=$(backup_dir_conf)
     cat >> "$DIR_CONF" <<EOF
 
 Pool {
@@ -1188,6 +1310,7 @@ EOF
     POST_LINE=""
     [ -n "$POST_CMD" ] && POST_LINE="  Client Run After Job = \"${POST_CMD}\""
 
+    [ -n "$CJ_BAK" ] || CJ_BAK=$(backup_dir_conf)
     cat >> "$DIR_CONF" <<EOF
 
 Job {
@@ -1206,8 +1329,11 @@ ${POST_LINE}
 EOF
 
     log_step "Validando e recarregando"
-    bacula-dir -t -c /etc/bacula/bacula-dir.conf
-    systemctl restart bacula-director
+    if ! reload_director; then
+        cp -p "$CJ_BAK" "$DIR_CONF"
+        log_err "A config ficou inválida - restaurei a versão anterior ($CJ_BAK). O job NÃO foi criado."
+        return 1
+    fi
 
     log_ok "Job '${JOB_NAME}' criado com sucesso."
     echo "Pra rodar agora: sudo bconsole -> run -> ${JOB_NAME}"
@@ -1315,7 +1441,7 @@ while true; do
     echo -e " ${GREEN}7)${RESET}  Listar clients cadastrados"
     echo -e " ${GREEN}8)${RESET}  Mostrar dados de conexão de um client"
     echo -e " ${GREEN}9)${RESET}  Trocar IP de um client"
-    echo -e " ${GREEN}10)${RESET} Adicionar pasta/drive a um job existente"
+    echo -e " ${GREEN}10)${RESET} Editar pastas de um FileSet (adicionar/remover/substituir)"
     echo -e " ${GREEN}11)${RESET} Alterar comando pré-backup de um job existente"
     echo -e " ${GREEN}12)${RESET} Ativar firewall (UFW) e ajustar permissões"
     echo -e " ${GREEN}13)${RESET} Reparar config (remover recursos duplicados)"
@@ -1328,7 +1454,7 @@ while true; do
     read -rp "Escolha uma opção: " OPT
     case "$OPT" in
         1) full_install ;;
-        2) configure_oci && restart_services ;;
+        2) configure_oci ;;
         3) restart_services ;;
         4) configure_static_ip ;;
         5) create_job ;;
