@@ -369,6 +369,7 @@ Pool {
   Pool Type = Backup
   Storage = Local-Backup-Storage
   Volume Retention = 45 days
+  Maximum Volume Bytes = 50G
   Label Format = "Local-\${Year}\${Month:p/2/0/r}\${Day:p/2/0/r}-\${NumVols}"
   Recycle = yes
 }
@@ -496,7 +497,7 @@ configure_oci() {
     cat > /etc/cron.d/rclone-backup-oci <<EOF
 # Sincroniza os volumes locais do Bacula com a OCI, todo dia.
 # Gerado por bacula-manager.sh
-${SYNC_MIN} ${SYNC_HOUR} * * * root /usr/bin/flock -n /var/run/rclone-backup.lock /usr/bin/rclone sync ${MOUNT_POINT}/bacula-volumes oci-backup:${OCI_BUCKET}/${OCI_FOLDER}/ --s3-chunk-size 256M --s3-upload-concurrency 8 --transfers 4 --log-file=/var/log/rclone-backup.log --log-level INFO
+${SYNC_MIN} ${SYNC_HOUR} * * * root /usr/bin/mountpoint -q ${MOUNT_POINT} && /usr/bin/flock -n /var/run/rclone-backup.lock /usr/bin/rclone sync ${MOUNT_POINT}/bacula-volumes oci-backup:${OCI_BUCKET}/${OCI_FOLDER}/ --s3-chunk-size 256M --s3-upload-concurrency 8 --transfers 4 --log-file=/var/log/rclone-backup.log --log-level INFO
 EOF
     chmod 644 /etc/cron.d/rclone-backup-oci
     touch /var/log/rclone-backup.log
@@ -1271,6 +1272,7 @@ Pool {
   Pool Type = Backup
   Storage = Local-Backup-Storage
   Volume Retention = ${RETENTION} days
+  Maximum Volume Bytes = 50G
   Label Format = "${JOB_NAME}-\${Year}\${Month:p/2/0/r}\${Day:p/2/0/r}-\${NumVols}"
   Recycle = yes
 }
@@ -1424,6 +1426,64 @@ show_client_info() {
 }
 
 # ======================================================================
+# Limitar tamanho dos volumes (50G) e fechar volumes gigantes
+# ======================================================================
+limit_volumes() {
+    local BCONSOLE="/opt/bacula/bin/bconsole"
+    command -v bconsole >/dev/null 2>&1 && BCONSOLE="bconsole"
+    log_info "=== Limitar volumes a 50G e fechar volumes gigantes ==="
+    echo "Isso NAO apaga nenhum dado. Os volumes gigantes atuais so deixam de"
+    echo "receber novos dados (viram 'Used'); os proximos backups vao para"
+    echo "volumes novos de ate 50G."
+    echo
+
+    local RUNNING
+    RUNNING=$(echo "status dir" | $BCONSOLE 2>/dev/null | sed -n '/Running Jobs/,/Terminated Jobs/p' | grep -c "is running")
+    if [ "${RUNNING:-0}" -gt 0 ]; then
+        log_warn "Ha ${RUNNING} job(s) rodando agora. Espere terminarem e rode de novo."
+        read -rp "Pressione ENTER para voltar..." _
+        return 1
+    fi
+    read -rp "Continuar? (s/N): " C
+    [[ "$C" =~ ^[sS]$ ]] || return 0
+
+    local TMP; TMP=$(mktemp)
+    awk '
+      /^[ \t]*Pool[ \t]*\{/ { inpool=1; has=0; buf=""; }
+      inpool {
+        buf = buf $0 "\n"
+        if ($0 ~ /Maximum Volume Bytes/) has=1
+        if ($0 ~ /^[ \t]*\}/) {
+          if (!has) sub(/\n[ \t]*\}\n$/, "\n  Maximum Volume Bytes = 50G\n}\n", buf)
+          printf "%s", buf; inpool=0
+        }
+        next
+      }
+      { print }
+    ' /etc/bacula/bacula-dir.conf > "$TMP"
+
+    apply_dir_conf "$TMP" || { rm -f "$TMP"; return 1; }
+    rm -f "$TMP"
+
+    local POOLS P
+    POOLS=$(sudo -u postgres psql bacula -Atc "select name from pool where name <> 'Scratch' order by name")
+    for P in $POOLS; do
+        printf 'update pool=%s\nupdate allfrompool=%s\n' "$P" "$P" | $BCONSOLE >/dev/null 2>&1
+    done
+    log_ok "Pools atualizados com Maximum Volume Bytes = 50G."
+
+    local V
+    for V in $(sudo -u postgres psql bacula -Atc "select volumename from media where volstatus='Append' and volbytes > 64*1024^3"); do
+        printf 'update volume=%s volstatus=Used\n' "$V" | $BCONSOLE >/dev/null 2>&1
+        log_ok "Volume ${V} fechado (Used)."
+    done
+
+    echo
+    sudo -u postgres psql bacula -c "select volumename, volstatus, round(volbytes/1024.0^3,1) as gb from media order by volbytes desc limit 10;"
+    read -rp "Pressione ENTER para voltar..." _
+}
+
+# ======================================================================
 # Menu
 # ======================================================================
 while true; do
@@ -1448,6 +1508,7 @@ while true; do
     echo -e " ${GREEN}14)${RESET} Instalar Bacularis (WebUI)"
     echo -e " ${GREEN}15)${RESET} Excluir um job (lista e escolhe pelo número)"
     echo -e " ${GREEN}16)${RESET} Configurar alerta de espaço em disco"
+    echo -e " ${GREEN}19)${RESET} Limitar volumes a 50G e fechar volumes gigantes"
     echo -e " ${RED}17)${RESET} Desinstalar tudo (Bacula + Bacularis + banco)"
     echo -e " ${GREEN}18)${RESET} Sair"
     echo -e "${BOLD}${CYAN}====================================================${RESET}"
@@ -1470,6 +1531,7 @@ while true; do
         15) delete_job ;;
         16) setup_disk_alert ;;
         17) full_purge ;;
+        19) limit_volumes ;;
         18) echo -e "${CYAN}Até mais.${RESET}"; exit 0 ;;
         *) log_err "Opção inválida." ;;
     esac
