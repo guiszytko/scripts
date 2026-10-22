@@ -528,7 +528,20 @@ EOF
 # ======================================================================
 # 5. Serviços
 # ======================================================================
+ensure_mount_dependency() {
+    # PostgreSQL e Bacula so sobem depois que o disco de backup montar
+    # (sem isso, apos um reboot o banco falha com "not accessible").
+    local s unit
+    for unit in $(systemctl list-unit-files --no-legend 'postgresql@*.service' 2>/dev/null | awk '{print $1}' | grep -v '@\.service'; echo postgresql@16-main.service bacula-director.service bacula-sd.service); do
+        s="${unit%.service}"
+        mkdir -p "/etc/systemd/system/${s}.service.d"
+        printf '[Unit]\nRequiresMountsFor=%s\n' "${MOUNT_POINT}" > "/etc/systemd/system/${s}.service.d/mount.conf"
+    done
+    systemctl daemon-reload
+}
+
 restart_services() {
+    ensure_mount_dependency
     log_step "Validando configuração"
     bacula-dir -t -c /etc/bacula/bacula-dir.conf
     bacula-sd -t -c /etc/bacula/bacula-sd.conf
@@ -1438,7 +1451,7 @@ limit_volumes() {
     echo
 
     local RUNNING
-    RUNNING=$(echo "status dir" | $BCONSOLE 2>/dev/null | sed -n '/Running Jobs/,/Terminated Jobs/p' | grep -c "is running")
+    RUNNING=$(echo "status dir" | $BCONSOLE 2>/dev/null | sed -n '/Running Jobs/,/Terminated Jobs/p' | grep -c "is running" || true)
     if [ "${RUNNING:-0}" -gt 0 ]; then
         log_warn "Ha ${RUNNING} job(s) rodando agora. Espere terminarem e rode de novo."
         read -rp "Pressione ENTER para voltar..." _
@@ -1466,7 +1479,7 @@ limit_volumes() {
     rm -f "$TMP"
 
     local POOLS P
-    POOLS=$(sudo -u postgres psql bacula -Atc "select name from pool where name <> 'Scratch' order by name")
+    POOLS=$(sudo -u postgres psql bacula -Atc "select name from pool where name <> 'Scratch' order by name" || true)
     for P in $POOLS; do
         printf 'update pool=%s\nupdate allfrompool=%s\n' "$P" "$P" | $BCONSOLE >/dev/null 2>&1
     done
